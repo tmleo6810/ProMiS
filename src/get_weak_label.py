@@ -6,8 +6,9 @@ import tiktoken
 from tqdm import tqdm
 from typing import Any
 import json
+import openai
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--model_name", type=str, default="gpt35_turbo")
@@ -54,6 +55,20 @@ def load_cache(cache_path: Path) -> list[dict[str, Any]]:
         return []
     with cache_path.open("r", encoding="utf-8") as fh:
         return [json.loads(line) for line in fh]
+    
+def category_mapping(answer: str) -> int:
+    answer_lc = answer.lower().lstrip()
+    if answer_lc.startswith("yes"):
+        return 1
+    if answer_lc.startswith("no"):
+        return 0
+    if answer_lc.startswith("unsure"):
+        return -1
+    raise ValueError(f"Unrecognized answer '{answer}'")
+
+def dump_cache(record: dict[str, Any], path: Path) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool = False, rationales: bool = False, cache_path: Path) -> None:
     system_context = (
@@ -63,6 +78,8 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
         " Ensure that your answers are grounded in reality, truthful and reliable."
         " You are expeted to answer with 'Yes' or 'No', but you are also allowed to answer with 'Unsure' if you do not have enough information or context to provide a reliable answer."
     )
+    if rationales:
+        system_context += " Afterwards, explain your answer by providing a rationale."
     input_format = """Title: {title}\nText: {text}"""
 
     existing_article_ids = {row["article_id"] for row in load_cache(cache_path)}
@@ -72,13 +89,54 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
             if article_row.article_id in existing_article_ids:
                 pbar.update(len(signals_df))
                 continue
-            input = input_format.format(title=article_row.title, text=article_row.text)
-            for question_row in signals_df.itertuples():
-                if rationales:
-                    system_context += " Afterwards, explain your answer by providing a rationale."
-                question = question_row.Question + " (Yes/Unsure/No)"
+            article = input_format.format(title=article_row.title, text=article_row.text)
+            gold_label = article_row.objective
+            signals_count = len(signals_df)
 
+            processed: dict[str, Any] = {}
+            for i, question_row in enumerate(signals_df.itertuples()):
+                question = question_row.Question + " (Yes/Unsure/No)"
                 try:
+                    answer = model.prompt(
+                        article=article,
+                        question=question,
+                        system_context=system_context,
+                        max_new_tokens=256 if rationales else 16
+                    )
+                except openai.OpenAIError as e:
+                    tqdm.write(
+                        f"[{type(e).__name__}] "
+                        f"id = {article_row.article_id} | "
+                        f"{question_row.Question} | {e}"
+                    )
+                    pbar.update(signals_count - i)
+                    break
+                try:
+                    cat_ws = category_mapping(answer)
+                except ValueError as e:
+                    tqdm.write(
+                        f"[{type(e).__name__}] "
+                        f"id = {article_row.article_id} | "
+                        f"{question_row.Question} | {e}"
+                    )
+                    pbar.update(signals_count - i)
+                    break
+                processed[question_row._2] = cat_ws
+                if rationales:
+                    processed[question_row._2 + "_rationale"] = answer
+                if verbose:
+                    tqdm.write(
+                        f"id = {article_row.article_id} | "
+                        f"{question_row.Question} → {cat_ws} / {answer}"
+                    )
+                pbar.update(1)
+            processed.update(
+                {
+                    "objective_true": gold_label,
+                    "article_id": article_row.article_id
+                }
+            )
+            dump_cache(processed, cache_path)
 
 if __name__ == "__main__":
     args = parse_arguments()
@@ -92,6 +150,8 @@ if __name__ == "__main__":
     CACHE_PATH = CACHE_DIR / f"{DATASET}.jsonl"
 
     DATASET_PATH = BASE_DIR / "data" / "dataset" / f"{DATASET}.csv"
+    # Test dataset
+    # DATASET_PATH = BASE_DIR / "data" / "dataset" / f"{DATASET}_sample.csv"
     SIGNALS_PATH = BASE_DIR / "data" / "signals.csv"
     
     assert DATASET_PATH.exists(), f"Dataset CSV not found: {DATASET_PATH}"
