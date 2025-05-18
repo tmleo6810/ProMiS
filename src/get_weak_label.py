@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 import pandas as pd
-from openai import OpenAI
+import logging
 import tiktoken
 from tqdm import tqdm
 from typing import Any
@@ -23,6 +23,7 @@ class GPT35Turbo:
         self.model_name = model_name
         self.encoder = tiktoken.encoding_for_model(model_name)
         self.context_window = 16385
+        self.client = openai.OpenAI()
 
     def _truncate_article(self, article: str, max_tokens: int) -> str:
         tokens = self.encoder.encode(article)
@@ -35,8 +36,7 @@ class GPT35Turbo:
         truncate_to = self.context_window - reserved
         article = self._truncate_article(article, truncate_to)
 
-        client = OpenAI()
-        response = client.responses.create(
+        response = self.client.responses.create(
             model=self.model_name,
             input=[
                 {"role": "developer", "content": system_context},
@@ -70,7 +70,7 @@ def dump_cache(record: dict[str, Any], path: Path) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool = False, rationales: bool = False, cache_path: Path) -> None:
+def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool = False, rationales: bool = False, cache_path: Path, logger: logging.Logger) -> None:
     system_context = (
         "You are a helpful and unbiased news verification assistant."
         " You will be provided with the title and the full body of text of a news article."
@@ -104,21 +104,23 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                         max_new_tokens=256 if rationales else 16
                     )
                 except openai.OpenAIError as e:
-                    tqdm.write(
-                        f"[{type(e).__name__}] "
+                    msg = (
+                        f"[{type(e).__name__}] | "
                         f"id = {article_row.article_id} | "
                         f"{question_row.Question} | {e}"
                     )
+                    logger.error(msg)
                     pbar.update(signals_count - i)
                     break
                 try:
                     cat_ws = category_mapping(answer)
                 except ValueError as e:
-                    tqdm.write(
-                        f"[{type(e).__name__}] "
+                    msg = (
+                        f"[{type(e).__name__}] | "
                         f"id = {article_row.article_id} | "
                         f"{question_row.Question} | {e}"
                     )
+                    logger.error(msg)
                     pbar.update(signals_count - i)
                     break
                 processed[question_row._2] = cat_ws
@@ -149,6 +151,18 @@ if __name__ == "__main__":
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_PATH = CACHE_DIR / f"{DATASET}.jsonl"
 
+    LOG_DIR = BASE_DIR / "logs"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_PATH = LOG_DIR / f"errors_{DATASET}.log"
+
+    logging.basicConfig(
+        filename=LOG_PATH,
+        encoding="utf-8",
+        level=logging.ERROR,
+        format="%(asctime)s - %(levelname)s : %(message)s"
+    )
+    logger = logging.getLogger(__name__)
+
     DATASET_PATH = BASE_DIR / "data" / "dataset" / f"{DATASET}.csv"
     # Test dataset
     # DATASET_PATH = BASE_DIR / "data" / "dataset" / f"{DATASET}_sample.csv"
@@ -175,5 +189,6 @@ if __name__ == "__main__":
         signals_df,
         verbose=args.verbose,
         rationales=args.rationales,
-        cache_path=CACHE_PATH
+        cache_path=CACHE_PATH,
+        logger=logger
     )
