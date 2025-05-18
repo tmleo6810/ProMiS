@@ -151,7 +151,7 @@ if __name__ == "__main__":
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_PATH = CACHE_DIR / f"{DATASET}.jsonl"
 
-    LOG_DIR = BASE_DIR / "logs"
+    LOG_DIR = BASE_DIR / "data" / "logs"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     LOG_PATH = LOG_DIR / f"errors_{DATASET}.log"
 
