@@ -4,7 +4,7 @@ import pandas as pd
 import logging
 import tiktoken
 from tqdm import tqdm
-from typing import Any
+from typing import Any, Tuple
 import json
 import openai
 from collections import deque
@@ -66,7 +66,7 @@ class GPT35Turbo:
             return article
         return self.encoder.decode(tokens[:max_tokens])
 
-    def prompt(self, article: str, question: str, system_context: str, max_new_tokens: int) -> str:
+    def prompt(self, article: str, question: str, system_context: str, max_new_tokens: int) -> Tuple[str, int]:
         reserved = max_new_tokens + 160
         truncate_to = self.context_window - reserved
         article = self._truncate_article(article, truncate_to)
@@ -83,7 +83,7 @@ class GPT35Turbo:
             max_output_tokens=max_new_tokens,
             temperature=0
         )
-        return response.output_text
+        return response.output_text, response.usage.total_tokens
     
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -129,6 +129,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
     existing_article_ids = {row["article_id"] for row in load_cache(cache_path)}
 
     total_latency = 0.0
+    total_tokens = 0
     request_latencies: list[float] = []
 
     with tqdm(total=len(df) * len(signals_df), unit="q") as pbar:
@@ -154,7 +155,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
 
                 start = time.perf_counter()
                 try:
-                    answer = model.prompt(
+                    answer, tokens = model.prompt(
                         article=article,
                         question=question,
                         system_context=system_context,
@@ -172,6 +173,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                 latency = time.perf_counter() - start
 
                 total_latency += latency
+                total_tokens += tokens
                 request_latencies.append(latency)
 
                 try:
@@ -205,6 +207,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
     
     print('=' * 60)
     print(f'Total requests            : {len(request_latencies)}')
+    print(f"Total tokens: {total_tokens}")
     print(f'Total latency (sum)       : {total_latency:.2f} seconds')
     if request_latencies:
         print(f'Average latency/request   : {total_latency / len(request_latencies):.2f} seconds')
