@@ -126,8 +126,10 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
     if rationales:
         system_context += " Afterwards, explain your answer by providing a rationale."
     input_format = """Title: {title}\nText: {text}"""
-
     existing_article_ids = {row["article_id"] for row in load_cache(cache_path)}
+
+    total_latency = 0.0
+    request_latencies: list[float] = []
 
     with tqdm(total=len(df) * len(signals_df), unit="q") as pbar:
         for article_row in df.itertuples():
@@ -150,6 +152,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                 )
                 limiter.acquire(input_tokens)
 
+                start = time.perf_counter()
                 try:
                     answer = model.prompt(
                         article=article,
@@ -166,6 +169,11 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                     logger.error(msg)
                     pbar.update(signals_count - i)
                     break
+                latency = time.perf_counter() - start
+
+                total_latency += latency
+                request_latencies.append(latency)
+
                 try:
                     cat_ws = category_mapping(answer)
                 except ValueError as e:
@@ -177,6 +185,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                     logger.error(msg)
                     pbar.update(signals_count - i)
                     break
+
                 processed[question_row._2] = cat_ws
                 if rationales:
                     processed[question_row._2 + "_rationale"] = answer
@@ -193,6 +202,13 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                 }
             )
             dump_cache(processed, cache_path)
+    
+    print('=' * 60)
+    print(f'Total requests            : {len(request_latencies)}')
+    print(f'Total latency (sum)       : {total_latency:.2f} seconds')
+    if request_latencies:
+        print(f'Average latency/request   : {total_latency / len(request_latencies):.2f} seconds')
+    print('=' * 60)
 
 if __name__ == "__main__":
     args = parse_arguments()
