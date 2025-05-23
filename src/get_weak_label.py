@@ -186,7 +186,7 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                     )
                     logger.error(msg)
                     pbar.update(signals_count - i)
-                    break
+                    continue
 
                 processed[question_row._2] = cat_ws
                 if rationales:
