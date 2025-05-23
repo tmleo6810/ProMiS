@@ -27,7 +27,7 @@ class RateLimiter:
     def _current_tokens(self) -> int:
         return sum(t for _, t in self._tok_ts)
 
-    def acquire(self, tokens: int) -> None:
+    def acquire(self, estimated_tokens: int) -> None:
         '''Block until sending `tokens` would respect both caps.'''
         while True:
             now = time.time()
@@ -37,18 +37,20 @@ class RateLimiter:
             if len(self._req_ts) >= self.max_rpm:
                 need_sleep = max(need_sleep, self._req_ts[0] + 60.0 - now)
 
-            if self._current_tokens() + tokens > self.max_tpm:
+            if self._current_tokens() + estimated_tokens > self.max_tpm and self._tok_ts:
                 need_sleep = max(need_sleep, self._tok_ts[0][0] + 60.0 - now)
 
             if need_sleep > 0:
                 time.sleep(need_sleep)
                 continue
-
-            # record usage and exit
-            now = time.time()
-            self._req_ts.append(now)
-            self._tok_ts.append((now, tokens))
             return
+    
+    def record(self, processed_tokens: int) -> None:
+        now = time.time()
+        self._purge(now)
+        self._req_ts.append(now)
+        self._tok_ts.append((now, processed_tokens))
+
 
 class GPT35Turbo:
     def __init__(self, model_name: str = "gpt-3.5-turbo-0125"):
@@ -58,7 +60,8 @@ class GPT35Turbo:
         self.client = openai.OpenAI()
 
     def count_tokens(self, text: str) -> int:
-        return len(self.encoder.encode(text))
+        n = len(self.encoder.encode(text))
+        return min(n, 16209) # 16209 is the max article token length
 
     def _truncate_article(self, article: str, max_tokens: int) -> str:
         tokens = self.encoder.encode(article)
@@ -146,12 +149,12 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                 question = "Question: "+ question_row.Question + " (Yes/Unsure/No)"
 
                 # Token counting & rate-limit enforcement
-                input_tokens = (
-                    110
+                estimated_tokens = (
+                    123
                     + model.count_tokens(article+"\n\n")
                     + model.count_tokens(question)
                 )
-                limiter.acquire(input_tokens)
+                limiter.acquire(estimated_tokens)
 
                 start = time.perf_counter()
                 try:
@@ -171,6 +174,8 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
                     pbar.update(signals_count - i)
                     break
                 latency = time.perf_counter() - start
+
+                limiter.record(tokens)
 
                 total_latency += latency
                 total_tokens += tokens
