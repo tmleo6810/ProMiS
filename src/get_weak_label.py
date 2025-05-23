@@ -7,16 +7,48 @@ from tqdm import tqdm
 from typing import Any
 import json
 import openai
+from collections import deque
+import time
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    
-    parser.add_argument("--model_name", type=str, default="gpt35_turbo")
-    parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--rationales", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
+class RateLimiter:
+    def __init__(self):
+        self.max_rpm = 500
+        self.max_tpm = 200000
+        self._req_ts: deque[float] = deque()           # timestamps of requests (sec)
+        self._tok_ts: deque[tuple[float, int]] = deque()  # (timestamp, tokens)
 
-    return parser.parse_args()
+    def _purge(self, now: float) -> None:
+        window_start = now - 60.0
+        while self._req_ts and self._req_ts[0] < window_start:
+            self._req_ts.popleft()
+        while self._tok_ts and self._tok_ts[0][0] < window_start:
+            self._tok_ts.popleft()
+
+    def _current_tokens(self) -> int:
+        return sum(t for _, t in self._tok_ts)
+
+    def acquire(self, tokens: int) -> None:
+        '''Block until sending `tokens` would respect both caps.'''
+        while True:
+            now = time.time()
+            self._purge(now)
+
+            need_sleep = 0.0
+            if len(self._req_ts) >= self.max_rpm:
+                need_sleep = max(need_sleep, self._req_ts[0] + 60.0 - now)
+
+            if self._current_tokens() + tokens > self.max_tpm:
+                need_sleep = max(need_sleep, self._tok_ts[0][0] + 60.0 - now)
+
+            if need_sleep > 0:
+                time.sleep(need_sleep)
+                continue
+
+            # record usage and exit
+            now = time.time()
+            self._req_ts.append(now)
+            self._tok_ts.append((now, tokens))
+            return
 
 class GPT35Turbo:
     def __init__(self, model_name: str = "gpt-3.5-turbo-0125"):
@@ -24,6 +56,9 @@ class GPT35Turbo:
         self.encoder = tiktoken.encoding_for_model(model_name)
         self.context_window = 16385
         self.client = openai.OpenAI()
+
+    def count_tokens(self, text: str) -> int:
+        return len(self.encoder.encode(text))
 
     def _truncate_article(self, article: str, max_tokens: int) -> str:
         tokens = self.encoder.encode(article)
@@ -49,6 +84,16 @@ class GPT35Turbo:
             temperature=0
         )
         return response.output_text
+    
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument("--model_name", type=str, default="gpt35_turbo")
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--rationales", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+
+    return parser.parse_args()
 
 def load_cache(cache_path: Path) -> list[dict[str, Any]]:
     if not cache_path.exists():
@@ -70,7 +115,7 @@ def dump_cache(record: dict[str, Any], path: Path) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool = False, rationales: bool = False, cache_path: Path, logger: logging.Logger) -> None:
+def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool = False, rationales: bool = False, cache_path: Path, logger: logging.Logger, limiter: RateLimiter) -> None:
     system_context = (
         "You are a helpful and unbiased news verification assistant."
         " You will be provided with the title and the full body of text of a news article."
@@ -95,7 +140,16 @@ def process(model, df: pd.DataFrame, signals_df: pd.DataFrame, *, verbose: bool 
 
             processed: dict[str, Any] = {}
             for i, question_row in enumerate(signals_df.itertuples()):
-                question = question_row.Question + " (Yes/Unsure/No)"
+                question = "Question: "+ question_row.Question + " (Yes/Unsure/No)"
+
+                # Token counting & rate-limit enforcement
+                input_tokens = (
+                    110
+                    + model.count_tokens(article+"\n\n")
+                    + model.count_tokens(question)
+                )
+                limiter.acquire(input_tokens)
+
                 try:
                     answer = model.prompt(
                         article=article,
@@ -179,6 +233,8 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unsupported model: {MODEL_NAME}")
     
+    limiter = RateLimiter()
+    
     print(f"Dataset: {DATASET} | Model: {MODEL_NAME}")
     if args.verbose:
         print(f"Rationales: {args.rationales}")
@@ -190,5 +246,6 @@ if __name__ == "__main__":
         verbose=args.verbose,
         rationales=args.rationales,
         cache_path=CACHE_PATH,
-        logger=logger
+        logger=logger,
+        limiter=limiter
     )
